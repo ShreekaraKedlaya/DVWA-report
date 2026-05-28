@@ -1,97 +1,102 @@
-# DVWA Vulnerability Writeup
-Here I did hands-on vulnerability analysis and exploitation writeups 
-performed on Damn Vulnerable Web Application (DVWA).
+# DVWA Command Injection Writeup
 
-# Command Injection – DVWA
+This is part of my ongoing DVWA exploitation series where I work through 
+each vulnerability across all security levels. Command Injection was 
+particularly interesting because the progression from Low to High shows 
+exactly why blacklist filtering keeps failing in the real world.
 
 ---
 
 # Low Security
 
 ## Overview
-In this lab, I tested the Command Injection vulnerability available in DVWA.
-The application takes an IP address from the user and performs a ping request.
-Since the input is not properly sanitized, additional commands can be executed
-by appending them to the input.
+The Command Injection module gives you a simple input field that accepts 
+an IP address and runs a ping against it. The idea is straightforward — 
+but when there's no sanitization on that input, you're essentially handing 
+the user a terminal.
 
 ---
 
 ## Initial Observation
-When I first opened the Command Injection module, I noticed a simple input 
-field asking for an IP address.
 
-I entered:
+I started by just entering a normal IP to see what the application actually 
+does under the hood.
+
 ```bash
 127.0.0.1
 ```
 
 <img width="1911" height="923" alt="image" src="https://github.com/user-attachments/assets/e056e88d-d843-4256-826f-a7a0b225c657" />
 
-
-The application displayed the ping result on the webpage. From this behavior,
-it was clear the backend was directly passing user input into a system command.
-I also noticed extra file and directory output in the response, which suggested
-the input was not being filtered at all.
+The ping output appeared directly on the page. What caught my eye was the 
+extra output at the bottom — `help`, `index.php`, `source` — file and 
+directory names leaking into the response. That immediately suggested the 
+input was being passed raw into a shell command with no filtering whatsoever.
 
 ---
 
-## Testing the Vulnerability
-To confirm command injection was possible, I appended a second command using
-the `&&` operator. The shell interprets `&&` as "run the next command only if
-the previous one succeeded" — since ping succeeds, the injected command runs
-immediately after.
+## Exploitation
 
-Payload used:
+My first instinct was to try chaining a second command using `&&`. In bash, 
+`&&` means "run the next command only if the previous one succeeded." Since 
+ping on localhost will always succeed, whatever comes after it will execute.
+
 ```bash
 127.0.0.1 && whoami
 ```
 
 <img width="732" height="293" alt="image" src="https://github.com/user-attachments/assets/6eb8a66d-32e8-4093-99f8-7dcb47ad5ff7" />
 
+Both the ping output and the result of `whoami` appeared on the page. The 
+server was running as `www-data` — meaning an attacker at this point has 
+read access to everything the web server can touch.
 
-The page displayed both the ping result and the output of `whoami`, confirming
-the server was executing appended commands. The server was running as `www-data`,
-meaning an attacker would have read access to all web files.
+I pushed a bit further just to confirm the scope:
 
-I tested further:
 ```bash
 127.0.0.1 && id
 127.0.0.1 && ls /
 ```
-Both executed successfully and returned system information on the webpage.
+
+Both returned system information without any issues.
 
 ---
 
 ## Source Code Analysis
+
 ```php
 $target = $_REQUEST['ip'];
 $cmd = shell_exec('ping -c 4 ' . $target);
 ```
 
-User input is taken directly from the request and concatenated into a shell
-command with no validation or sanitization. The shell interprets special
-operators like `&&` as command separators, which is what makes injection
-possible here.
+That's it. User input goes straight into `shell_exec()` with zero 
+validation. The shell sees the full string including whatever operators 
+you append, and executes accordingly. There's nothing to bypass here 
+because there's nothing in the way.
 
 ---
 
 ## Impact
-If this vulnerability exists in a real application, an attacker could:
-- Access sensitive files
-- Gather server and user information
-- Install malicious programs
-- Escalate privileges
-- Take complete control of the system
 
-Severity depends on the permissions of the web server process.
+In a real application this would be critical. From here an attacker could:
+- Read sensitive files including configs and credentials
+- Map the internal network
+- Download and execute malicious payloads
+- Move laterally if other services are accessible
+- Establish persistence
+
+The `www-data` context limits privilege escalation directly, but it's 
+often enough to find credentials stored in web application config files 
+that open doors elsewhere.
 
 ---
 
 ## Remediation
-- Accept only valid IP address formats using regex whitelist
-- Avoid `shell_exec()` wherever possible
-- Use `escapeshellarg()` to sanitize input if shell commands are necessary
-- Run web applications with minimal privileges (principle of least privilege)
+- Validate input strictly — only accept strings matching a valid IP format
+- Never pass raw user input to `shell_exec()`, `exec()`, or `system()`
+- Use `escapeshellarg()` if shell execution genuinely can't be avoided
+- Apply least privilege — the web server process shouldn't run with more 
+  permissions than it needs
 
 ---
 ---
@@ -99,14 +104,17 @@ Severity depends on the permissions of the web server process.
 # Medium Security
 
 ## Overview
-At Medium security, DVWA attempts to block command injection by filtering out
-known dangerous operators from the input. This demonstrates a common but
-flawed approach — blacklist filtering — and why it is not a reliable defense.
+
+Medium security introduces filtering. The developer clearly recognised 
+that `&&` and `;` are dangerous, so they removed them. It's a reasonable 
+first instinct — but it's the wrong approach, and it took about thirty 
+seconds to get past.
 
 ---
 
 ## What Changed
-Clicking "View Source" at Medium level reveals the following filter:
+
+The source code at this level shows:
 
 ```php
 $substitutions = array(
@@ -116,26 +124,27 @@ $substitutions = array(
 $target = str_replace( array_keys($substitutions), $substitutions, $target );
 ```
 
-The application removes `&&` and `;` from the input before passing it to the
-shell. At first glance this looks like a fix, but it only blocks two specific
-operators while leaving others untouched.
+The app strips `&&` and `;` before passing input to the shell. On the 
+surface that looks like a fix. The problem is that bash has several ways 
+to chain commands, and this only blocks two of them.
 
 ---
 
 ## Bypass
-The `|` (pipe) operator is not in the blacklist. In shell, `|` passes the
-output of the first command as input to the second. Even if ping produces no
-useful output, the second command still executes.
 
-Payload used:
+The `|` pipe operator isn't on the blacklist. Pipe works differently from 
+`&&` — it passes the stdout of the first command as stdin to the second — 
+but the second command still executes regardless, which is all we need.
+
 ```bash
 127.0.0.1 | whoami
 ```
 
 <img width="752" height="202" alt="image" src="https://github.com/user-attachments/assets/bdb596b6-cbc8-4dd3-a2e5-65a6f176f4a4" />
 
-The page returned the result of `whoami`, confirming the filter was bypassed.
-I tested further to confirm:
+`whoami` output appeared immediately. Same result as Low, different 
+operator. I confirmed with a couple more:
+
 ```bash
 127.0.0.1 | id
 127.0.0.1 | ls /
@@ -144,31 +153,149 @@ I tested further to confirm:
 <img width="732" height="143" alt="image" src="https://github.com/user-attachments/assets/50825bad-152f-4edc-84cf-ebc7f06c1c0c" />
 <img width="746" height="583" alt="image" src="https://github.com/user-attachments/assets/9509f107-8390-495a-bf77-653185bad747" />
 
-
-Both executed successfully, identical outcome to Low security.
+Both worked without any issues.
 
 ---
 
-## Why the Blacklist Failed
-The filter only accounts for operators the developer thought of. Shell has
-multiple command chaining operators — `&&`, `||`, `;`, `|`, backticks, `$()` —
-and blocking two of them leaves the rest available. This is the fundamental
-problem with blacklist-based filtering: an attacker only needs to find one
-gap, while the developer has to anticipate every possible bypass.
+## Why This Keeps Failing
+
+Blacklisting is fundamentally reactive. You block what you know is 
+dangerous today, and an attacker finds what you didn't think of. Bash 
+alone gives you `&&`, `||`, `;`, `|`, backticks, and `$()` for command 
+execution — and that's before you start thinking about encoding tricks 
+or whitespace manipulation.
+
+The developer has to get the list perfect every single time. The attacker 
+just needs one gap.
 
 ---
 
 ## Impact
-Same as Low security. The filter provides a false sense of security — the
-vulnerability is fully exploitable with a trivial one-character change to
-the payload.
+
+Identical to Low. The filter changes the payload by one character and 
+achieves nothing in practice.
 
 ---
 
 ## Remediation
-Blacklist filtering is not a reliable fix. The correct approach remains the
-same as Low:
-- Whitelist validation — only allow input that matches a strict IP address
-  pattern (e.g., regex `^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$`)
-- Avoid passing user input to shell functions entirely
-- Use `escapeshellarg()` if shell execution is unavoidable
+
+Blacklisting isn't the answer here. The same whitelist approach from Low 
+applies — if the input should be an IP address, only accept strings that 
+look like IP addresses and reject everything else before it gets anywhere 
+near a shell function.
+
+---
+---
+
+# High Security
+
+## Overview
+
+High security is where it gets genuinely interesting. The filter is much 
+more aggressive this time — but there's still a bypass, and it comes down 
+to one missing character in the pattern matching.
+
+---
+
+## What Changed
+
+The source code at High level:
+
+```php
+$substitutions = array(
+    '&'  => '',
+    ';'  => '',
+    '| ' => '',
+    '-'  => '',
+    '$'  => '',
+    '('  => '',
+    ')'  => '',
+    '`'  => '',
+    '||' => '',
+);
+$target = str_replace( array_keys($substitutions), $substitutions, $target );
+```
+
+This is a much longer blacklist. `&`, `;`, `||`, backticks, `$()` — all 
+gone. The pipe `|` is in there too this time. At first glance it looks 
+like command injection is fully blocked.
+
+Look closer at the pipe entry: it's `'| '` — pipe followed by a space. 
+Not just `'|'`.
+
+That one missing character is the entire bypass.
+
+---
+
+## Bypass
+
+If the filter strips `| ` (with space) but not `|` (without space), then 
+removing the space before the pipe should work:
+
+```bash
+127.0.0.1|whoami
+```
+
+No space between the IP and the pipe operator.
+
+<img width="743" height="182" alt="image" src="https://github.com/user-attachments/assets/6b7dd014-36c8-4a4a-838e-0601725e773a" />
+
+
+It worked. The output of `whoami` appeared on the page exactly as it did 
+at Low and Medium.
+
+```bash
+127.0.0.1|id
+127.0.0.1|ls /
+```
+
+<img width="741" height="181" alt="image" src="https://github.com/user-attachments/assets/48e13f18-deec-4c9d-9c57-704563ef26a8" />
+<img width="737" height="587" alt="image" src="https://github.com/user-attachments/assets/bd3f547e-a7d5-43a5-bd46-6b49641630a9" />
+
+Same results across the board.
+
+---
+
+## Why It Still Failed
+
+The developer added `| ` to the blacklist but accidentally left `|` 
+without a space uncovered. This is a perfect example of why manual 
+blacklisting is error-prone even when the developer is actively trying 
+to be thorough — one typo, one forgotten edge case, and the whole filter 
+falls apart.
+
+This kind of mistake is also easy to miss in a code review because `| ` 
+and `|` look nearly identical at a glance.
+
+---
+
+## Impact
+
+Still fully exploitable. Three different security levels, three different 
+payloads, same outcome every time.
+
+---
+
+## Final Remediation Note
+
+Across all three levels, the correct fix was never implemented — because 
+blacklisting is the wrong tool for this job. The right approach is:
+
+**Whitelist validation before the input reaches any shell function.**
+
+```php
+// Only allow valid IPv4 format
+if (!filter_var($target, FILTER_VALIDATE_IP)) {
+    die("Invalid IP address.");
+}
+```
+
+This rejects anything that isn't a valid IP address outright. No operator, 
+no encoding trick, no edge case gets through — because the valid input 
+space is defined explicitly rather than trying to enumerate the bad inputs.
+
+If shell execution is unavoidable, wrap input in `escapeshellarg()` as an 
+additional layer. But input validation should always be the first line of 
+defence.
+
+---
